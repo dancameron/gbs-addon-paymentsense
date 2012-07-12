@@ -2,20 +2,22 @@
 
 class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 
-	const API_ENDPOINT_SANDBOX = 'https://secure.paymentsense.com/interfaces/a.net.test';
-	const API_ENDPOINT_LIVE = 'https://secure.paymentsense.com/gateway/transact.dll';
-
-
+	const API_ENDPOINT = 'paymentsensegateway.com';
+	const API_ENDPOINT_PORT = '4430';
 	const MODE_TEST = 'sandbox';
 	const MODE_LIVE = 'live';
-	const API_USERNAME_OPTION = 'gb_paymentsense_username';
+	const API_MERCHANTID_OPTION = 'gb_paymentsense_username';
 	const API_PASSWORD_OPTION = 'gb_paymentsense_password';
+	const API_SECRETKEY_OPTION = 'gb_paymentsense_secretkey';
 	const API_MODE_OPTION = 'gb_paymentsense_mode';
+	const API_CC_OPTION = 'gb_paymentsense_currency_code';
 	const PAYMENT_METHOD = 'Credit (PaymentSense)';
 	protected static $instance;
 	private $api_mode = self::MODE_TEST;
-	private $api_username = '';
+	private $api_merchantid = '';
 	private $api_password = '';
+	private $api_secretkey = '';
+	private $currency_code = '';
 
 	protected static function get_instance() {
 		if ( !( isset( self::$instance ) && is_a( self::$instance, __CLASS__ ) ) ) {
@@ -25,10 +27,10 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 	}
 
 	private function get_api_url() {
-		if ( $this->api_mode == self::MODE_LIVE ) {
-			return self::API_ENDPOINT_LIVE;
+		if ( self::API_ENDPOINT_PORT == '443' ) {
+			return trailingslashit( self::API_ENDPOINT );
 		} else {
-			return self::API_ENDPOINT_SANDBOX;
+			return trailingslashit( self::API_ENDPOINT . ':' . self::API_ENDPOINT_PORT );
 		}
 	}
 
@@ -38,8 +40,10 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 
 	protected function __construct() {
 		parent::__construct();
-		$this->api_username = get_option( self::API_USERNAME_OPTION, '' );
+		$this->api_merchantid = get_option( self::API_MERCHANTID_OPTION, '' );
 		$this->api_password = get_option( self::API_PASSWORD_OPTION, '' );
+		$this->api_secretkey = get_option( self::API_SECRETKEY_OPTION, time() );
+		$this->currency_code = get_option( self::API_CC_OPTION, '826' );
 		$this->api_mode = get_option( self::API_MODE_OPTION, self::MODE_TEST );
 
 		add_action( 'admin_init', array( $this, 'register_settings' ), 10, 0 );
@@ -73,36 +77,15 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 			}
 		}
 
-		require_once ('lib/PaymentSystem.php');
-
-
-
-
-		/*
-		 * Setup and POST data
-		 */
-		$post_data = $this->post_data( $checkout, $purchase );
-		if ( self::DEBUG ) error_log( '--------- POST DATA----------' . print_r( $post_data, true ) );
-
-		$response = wp_remote_post( $this->get_api_url(), array(
-				'method' => 'POST',
-				'body' => $post_data,
-				'timeout' => apply_filters( 'http_request_timeout', 15 ),
-				'sslverify' => false
-			) );
-		if ( is_wp_error( $response ) ) {
-			return FALSE;
-		}
-		if ( self::DEBUG ) error_log( '----------Response----------' . print_r( $response, TRUE ) );
-
-		if ( $response_code != 1 ) {
-			$this->set_error_messages( $response_error );
-			return FALSE;
+		$transaction_response = $this->process_sale( $checkout, $purchase );
+		if ( !is_object($transaction_response) ) {
+			return;
 		}
 
-		/*
-		 * Purchase since payment was successful above.
-		 */
+
+		// Purchase since payment was successful above.
+		
+		// Create deals array.
 		$deal_info = array(); // creating purchased products array for payment below
 		foreach ( $purchase->get_products() as $item ) {
 			if ( isset( $item['payment_method'][$this->get_payment_method()] ) ) {
@@ -112,6 +95,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 				$deal_info[$item['deal_id']][] = $item;
 			}
 		}
+		// Include shipping in payment object
 		if ( isset( $checkout->cache['shipping'] ) ) {
 			$shipping_address = array();
 			$shipping_address['first_name'] = $checkout->cache['shipping']['first_name'];
@@ -122,12 +106,13 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 			$shipping_address['postal_code'] = $checkout->cache['shipping']['postal_code'];
 			$shipping_address['country'] = $checkout->cache['shipping']['country'];
 		}
+		// New payment
 		$payment_id = Group_Buying_Payment::new_payment( array(
 				'payment_method' => $this->get_payment_method(),
 				'purchase' => $purchase->get_id(),
-				'amount' => $post_data['x_amount'], // TODO CHANGE to NVP_DATA Match
+				'amount' => gb_get_number_format( $purchase->get_total( $this->get_payment_method() ) ), // TODO CHANGE to NVP_DATA Match
 				'data' => array(
-					'api_response' => $response,
+					'api_response' => $transaction_response,
 					'masked_cc_number' => $this->mask_card_number( $this->cc_cache['cc_number'] ), // save for possible credits later
 				),
 				'deals' => $deal_info,
@@ -173,6 +158,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 	private function set_error_messages( $response, $display = TRUE ) {
 		if ( $display ) {
 			self::set_message( $response, self::MESSAGE_STATUS_ERROR );
+			error_log( $response );
 		} else {
 			error_log( $response );
 		}
@@ -185,97 +171,273 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 	 * @param Group_Buying_Purchase $purchase
 	 * @return array
 	 */
-	private function post_data( Group_Buying_Checkouts $checkout, Group_Buying_Purchase $purchase ) {
-		error_log( "checkout: " . print_r( $checkout->cache, true ) );
+	private function process_sale( Group_Buying_Checkouts $checkout, Group_Buying_Purchase $purchase ) {
 		$user = get_userdata( $purchase->get_user() );
-		$NVP_Data = array();
-		$NVP_Data ['x_login'] = $this->api_username;
-		$NVP_Data ['x_tran_key'] = $this->api_password;
-
-		$NVP_Data ['x_card_num'] = $this->cc_cache['cc_number'];
-
-		$NVP_Data ['x_exp_date'] = substr( '0' . $this->cc_cache['cc_expiration_month'], -2 ) . substr( $this->cc_cache['cc_expiration_year'], -2 );
-
-		$NVP_Data ['x_card_code'] = $this->cc_cache['cc_cvv'];
-
-		$NVP_Data ['x_amount'] = sprintf( '%0.2f', $purchase->get_total( $this->get_payment_method() ) );
-
-		$NVP_Data ['x_first_name'] = $checkout->cache['billing']['first_name'];
-		$NVP_Data ['x_last_name'] = $checkout->cache['billing']['last_name'];
-		$NVP_Data ['x_address'] = $checkout->cache['billing']['street'];
-		$NVP_Data ['x_city'] = $checkout->cache['billing']['city'];
-		$NVP_Data ['x_state'] = $checkout->cache['billing']['zone'];
-		$NVP_Data ['x_zip'] = $checkout->cache['billing']['postal_code'];
-		$NVP_Data ['x_phone'] = $checkout->cache['billing']['phone'];
-
-		$NVP_Data ['x_email'] = $user->user_email;
-		$NVP_Data ['x_cust_id'] = $user->ID;
-
-		$NVP_Data['x_invoice_num'] = $purchase->get_id();
-
-		$NVP_Data['x_freight'] = sprintf( '%0.2f', $purchase->get_shipping_total( $this->get_payment_method() ) );
-		$NVP_Data['x_tax'] = sprintf( '%0.2f', $purchase->get_tax_total( $this->get_payment_method() ) );
-
-		$line_items = '';
-		if (
-			$subtotal == gb_get_number_format(0) ||
-			( $filtered_total < $cart->get_total()
-			&& ($cart->get_subtotal() + $filtered_total - $cart->get_total()) == 0
-			)
-		) {
-			if ( $NVP_Data['x_freight'] != gb_get_number_format(0) ) {
-				$NVP_Data['x_amount'] = $NVP_Data['x_freight'];
-				$NVP_Data['x_freight'] = gb_get_number_format(0);
-			} elseif ( $NVP_Data['x_tax'] != gb_get_number_format(0) ) {
-				$NVP_Data['x_amount'] = $NVP_Data['x_tax'];
-				$NVP_Data['x_tax'] = gb_get_number_format(0);
+		$amount = gb_get_number_format( $purchase->get_total( $this->get_payment_method() ) );
+		$description = '';
+		foreach ( $purchase->get_products() as $item ) {
+			if ( isset( $item['payment_method'][$this->get_payment_method()] ) ) {
+				$deal = Group_Buying_Deal::get_instance( $item['deal_id'] );
+				$description .= $deal->get_slug().', ';
 			}
-			$tax_li = ( $NVP_Data['x_tax'] > gb_get_number_format(0) ) ? 'Y' : 'N' ;
-			$line_items .= $purchase->get_ID().'<|>CART<|><|>1<|>'.$NVP_Data['x_amount'].'<|>'.$tax_li.'&x_line_item=';
+		}
+
+		require_once 'lib/PaymentSystem.php';
+		$rgeplRequestGatewayEntryPointList = new RequestGatewayEntryPointList();
+		// you need to put the correct gateway entry point urls in here
+		// contact support to get the correct urls
+
+		// The actual values to use for the entry points can be established in a number of ways
+		// 1) By periodically issuing a call to GetGatewayEntryPoints
+		// 2) By storing the values for the entry points returned with each transaction
+		// 3) Speculatively firing transactions at https://gw1.xxx followed by gw2, gw3, gw4....
+		// The lower the metric (2nd parameter) means that entry point will be attempted first,
+		// EXCEPT if it is -1 - in this case that entry point will be skipped
+		// NOTE: You do NOT have to add the entry points in any particular order - the list is sorted
+		// by metric value before the transaction sumbitting process begins
+		// The 3rd parameter is a retry attempt, so it is possible to try that entry point that number of times
+		// before failing over onto the next entry point in the list
+		$rgeplRequestGatewayEntryPointList->add( "https://gw1.".self::get_api_url(), 100, 1 );
+		$rgeplRequestGatewayEntryPointList->add( "https://gw2.".self::get_api_url(), 200, 1 );
+		$rgeplRequestGatewayEntryPointList->add( "https://gw3.".self::get_api_url(), 300, 1 );
+
+		$cdtCardDetailsTransaction = new CardDetailsTransaction( $rgeplRequestGatewayEntryPointList );
+
+		$cdtCardDetailsTransaction->getMerchantAuthentication()->setMerchantID( $this->api_merchantid );
+		$cdtCardDetailsTransaction->getMerchantAuthentication()->setPassword( $this->api_password );
+
+		$cdtCardDetailsTransaction->getTransactionDetails()->getMessageDetails()->setTransactionType( "SALE" );
+
+		$cdtCardDetailsTransaction->getTransactionDetails()->getAmount()->setValue( $amount );
+
+		$cdtCardDetailsTransaction->getTransactionDetails()->getCurrencyCode()->setValue( self::$currency_code );
+
+
+		$cdtCardDetailsTransaction->getTransactionDetails()->setOrderID( $purchase->get_id() );
+		$cdtCardDetailsTransaction->getTransactionDetails()->setOrderDescription( $description );
+
+		$cdtCardDetailsTransaction->getTransactionDetails()->getTransactionControl()->getEchoCardType()->setValue( true );
+		$cdtCardDetailsTransaction->getTransactionDetails()->getTransactionControl()->getEchoAmountReceived()->setValue( true );
+		$cdtCardDetailsTransaction->getTransactionDetails()->getTransactionControl()->getEchoAVSCheckResult()->setValue( true );
+		$cdtCardDetailsTransaction->getTransactionDetails()->getTransactionControl()->getEchoCV2CheckResult()->setValue( true );
+		$cdtCardDetailsTransaction->getTransactionDetails()->getTransactionControl()->getThreeDSecureOverridePolicy()->setValue( true );
+		$cdtCardDetailsTransaction->getTransactionDetails()->getTransactionControl()->getDuplicateDelay()->setValue( 60 );
+
+		$cdtCardDetailsTransaction->getTransactionDetails()->getThreeDSecureBrowserDetails()->getDeviceCategory()->setValue( 0 );
+		$cdtCardDetailsTransaction->getTransactionDetails()->getThreeDSecureBrowserDetails()->setAcceptHeaders( "*/*" );
+		$cdtCardDetailsTransaction->getTransactionDetails()->getThreeDSecureBrowserDetails()->setUserAgent( $_SERVER["HTTP_USER_AGENT"] );
+
+		$cdtCardDetailsTransaction->getCardDetails()->setCardName( $checkout->cache['billing']['first_name'] . ' ' . $checkout->cache['billing']['last_name'] );
+		$cdtCardDetailsTransaction->getCardDetails()->setCardNumber( $this->cc_cache['cc_number'] );
+
+		if ( $this->cc_cache['cc_expiration_month'] != '' ) {
+			$cdtCardDetailsTransaction->getCardDetails()->getExpiryDate()->getMonth()->setValue( substr( '0' . $this->cc_cache['cc_expiration_month'], -2 ) );
+		}
+		if ( $this->cc_cache['cc_expiration_year'] != '' ) {
+			$cdtCardDetailsTransaction->getCardDetails()->getExpiryDate()->getYear()->setValue( substr( $this->cc_cache['cc_expiration_year'], -2 ) );
+		}
+		if ( $this->cc_cache['cc_start_expiration_month'] != '' ) {
+			$cdtCardDetailsTransaction->getCardDetails()->getStartDate()->getMonth()->setValue( substr( '0' . $this->cc_cache['cc_start_expiration_month'], -2 ) );
+		}
+		if ( $this->cc_cache['cc_start_expiration_year'] != '' ) {
+			$cdtCardDetailsTransaction->getCardDetails()->getStartDate()->getYear()->setValue( substr( $this->cc_cache['cc_start_expiration_year'], -2 ) );
+		}
+
+		// $cdtCardDetailsTransaction->getCardDetails()->setIssueNumber( $IssueNumber );
+		$cdtCardDetailsTransaction->getCardDetails()->setCV2( $this->cc_cache['cc_cvv'] );
+
+		$cdtCardDetailsTransaction->getCustomerDetails()->getBillingAddress()->setAddress1( $checkout->cache['billing']['first_name'] . ' ' . $checkout->cache['billing']['last_name'] );
+		$cdtCardDetailsTransaction->getCustomerDetails()->getBillingAddress()->setAddress2( $checkout->cache['billing']['street'] );
+		$cdtCardDetailsTransaction->getCustomerDetails()->getBillingAddress()->setCity( $checkout->cache['billing']['city'] );
+		$cdtCardDetailsTransaction->getCustomerDetails()->getBillingAddress()->setState( $checkout->cache['billing']['zone'] );
+		$cdtCardDetailsTransaction->getCustomerDetails()->getBillingAddress()->setPostCode( $checkout->cache['billing']['phone'] );
+
+		if ( $checkout->cache['billing']['country'] != '' &&
+			$checkout->cache['billing']['country'] != '-1' &&
+			$iclISOCountryList->getISOCountry( $checkout->cache['billing']['country'], $icISOCountry ) ) {
+			$cdtCardDetailsTransaction->getCustomerDetails()->getBillingAddress()->getCountryCode()->setValue( $icISOCountry->getISOCode() );
+		}
+
+		$cdtCardDetailsTransaction->getCustomerDetails()->setEmailAddress( $user->user_email );
+		$cdtCardDetailsTransaction->getCustomerDetails()->setPhoneNumber( $checkout->cache['billing']['phone'] );
+		$cdtCardDetailsTransaction->getCustomerDetails()->setCustomerIPAddress( $_SERVER['REMOTE_ADDR'] );
+
+		$boTransactionProcessed = $cdtCardDetailsTransaction->processTransaction( $cdtrCardDetailsTransactionResult, $todTransactionOutputData );
+
+		error_log( "PROCESSED TRANSACTION +++++++++++++++++++: " . print_r( $boTransactionProcessed, true ) );
+
+		if ( $boTransactionProcessed == false ) {
+			// could not communicate with the payment gateway 
+			$message = "Couldn't communicate with payment gateway". $cdtCardDetailsTransaction->getLastException()->getMessage();
+			self::set_error_messages( $message );
+			$TransactionSuccessful = FALSE;
 		} else {
-			foreach ( $purchase->get_products() as $item ) {
-				if ( isset( $item['payment_method'][$this->get_payment_method()] ) ) {
-					$deal = Group_Buying_Deal::get_instance( $item['deal_id'] );
-					$tax = $deal->get_tax( $local_billing );
-					$tax = ( !empty( $tax ) && $tax > '0' ) ? 'Y' : 'N' ;
-					$line_items .= $item['deal_id'].'<|>'.substr( $deal->get_slug(), 0, 31 ).'<|><|>'.$item['quantity'].'<|>'.gb_get_number_format( $item['unit_price'] ).'<|>'.$tax.'&x_line_item=';
+			switch ( $cdtrCardDetailsTransactionResult->getStatusCode() ) {
+				case 0:
+					// status code of 0 - means transaction successful
+					$Message = $cdtrCardDetailsTransactionResult->getMessage();
+					self::set_error_messages( $Message );
+					$TransactionSuccessful = $cdtrCardDetailsTransactionResult;
+					break;
+				case 3:
+					// status code of 3 - means 3D Secure authentication required
+					$PaREQ = $todTransactionOutputData->getThreeDSecureOutputData()->getPaREQ();
+					$CrossReference = $todTransactionOutputData->getCrossReference();
+					// Process 3D secure
+					return self::process_3d_secure( $OrderID, $cdtrCardDetailsTransactionResult->getStatusCode(), $cdtrCardDetailsTransactionResult->getMessage(), $CrossReference, $PaREQ );
+					break;
+				case 5:
+					// status code of 5 - means transaction declined
+					$Message = $cdtrCardDetailsTransactionResult->getMessage();
+					self::set_error_messages( $Message );
+					$TransactionSuccessful = FALSE;
+					break;
+				case 20:
+					// status code of 20 - means duplicate transaction
+					if ( $cdtrCardDetailsTransactionResult->getPreviousTransactionResult()->getStatusCode()->getValue() == 0 ) {
+						$TransactionSuccessful = TRUE;
+					}
+					else {
+						$PreviousTransactionMessage = $cdtrCardDetailsTransactionResult->getPreviousTransactionResult()->getMessage();
+						self::set_error_messages( $PreviousTransactionMessage );
+						$TransactionSuccessful = FALSE;
+					}
+					break;
+				case 30:
+					// status code of 30 - means an error occurred
+					$Message = $cdtrCardDetailsTransactionResult->getMessage();
+					if ( $cdtrCardDetailsTransactionResult->getErrorMessages()->getCount() > 0 ) {
+						$Message = $Message."<br /><ul>";
+
+						for ( $LoopIndex = 0; $LoopIndex < $cdtrCardDetailsTransactionResult->getErrorMessages()->getCount(); $LoopIndex++ ) {
+							$Message = $Message."<li>".$cdtrCardDetailsTransactionResult->getErrorMessages()->getAt( $LoopIndex )."</li>";
+						}
+						$Message = $Message."</ul>";
+						$TransactionSuccessful = FALSE;
+					}
+					if ( $todTransactionOutputData == null ) {
+						$szResponseCrossReference = "";
+					}
+					else {
+						$szResponseCrossReference = $todTransactionOutputData->getCrossReference();
+					}
+					self::set_error_messages( $Message );
+					break;
+				default:
+					// unhandled status code
+					$Message = $cdtrCardDetailsTransactionResult->getMessage();
+					if ( $todTransactionOutputData == null ) {
+						$szResponseCrossReference = "";
+					}
+					else {
+						$szResponseCrossReference = $todTransactionOutputData->getCrossReference();
+					}
+					$TransactionSuccessful = FALSE;
+					self::set_error_messages( $Message );
+					break;
+			}
+		}
+		return $TransactionSuccessful;
+	}
+
+
+	public static function process_3d_secure( $OrderID, $StatusCode, $Message, $CrossReference, $PaREQ ) {
+
+		require_once 'lib/PaymentSystem.php';
+		$rgeplRequestGatewayEntryPointList = new RequestGatewayEntryPointList();
+		$rgeplRequestGatewayEntryPointList->add( "https://gw1.".self::get_api_url(), 100, 1 );
+		$rgeplRequestGatewayEntryPointList->add( "https://gw2.".self::get_api_url(), 200, 1 );
+		$rgeplRequestGatewayEntryPointList->add( "https://gw3.".self::get_api_url(), 300, 1 );
+
+		$tdsaThreeDSecureAuthentication = new CardDetailsTransaction( $rgeplRequestGatewayEntryPointList );
+
+		$tdsaThreeDSecureAuthentication->getMerchantAuthentication()->setMerchantID( $this->api_merchantid );
+		$tdsaThreeDSecureAuthentication->getMerchantAuthentication()->setPassword( $this->api_password );
+
+		$tdsaThreeDSecureAuthentication->getThreeDSecureInputData()->setCrossReference( $CrossReference );
+		$tdsaThreeDSecureAuthentication->getThreeDSecureInputData()->setPaRES( $PaREQ );
+
+		$boTransactionProcessed = $tdsaThreeDSecureAuthentication->processTransaction( $tdsarThreeDSecureAuthenticationResult, $todTransactionOutputData );
+
+		if ( $boTransactionProcessed == false ) {
+			// could not communicate with the payment gateway
+			$NextFormMode = "RESULTS";
+			$Message = "Couldn't communicate with payment gateway";
+			$TransactionSuccessful = false;
+			PaymentFormHelper::reportTransactionResults( $CrossReference, 30, $Message, null );
+		}
+		else {
+			switch ( $tdsarThreeDSecureAuthenticationResult->getStatusCode() ) {
+			case 0:
+				// status code of 0 - means transaction successful
+				$TransactionSuccessful = TRUE;
+				break;
+			case 5:
+				// status code of 5 - means transaction declined
+				$Message = $tdsarThreeDSecureAuthenticationResult->getMessage();
+				self::set_error_messages( $Message );
+				$TransactionSuccessful = FALSE;
+				break;
+			case 20:
+				// status code of 20 - means duplicate transaction
+				if ( $tdsarThreeDSecureAuthenticationResult->getPreviousTransactionResult()->getStatusCode()->getValue() == 0 ) {
+					$TransactionSuccessful = TRUE;
 				}
+				else {
+					$PreviousTransactionMessage = $tdsarThreeDSecureAuthenticationResult->getPreviousTransactionResult()->getMessage();
+					self::set_error_messages( $PreviousTransactionMessage );
+					$TransactionSuccessful = FALSE;
+				}
+				break;
+			case 30:
+				// status code of 30 - means an error occurred
+				$Message = $tdsarThreeDSecureAuthenticationResult->getMessage();
+				if ( $tdsarThreeDSecureAuthenticationResult->getErrorMessages()->getCount() > 0 ) {
+					$Message = $Message."<br /><ul>";
+
+					for ( $LoopIndex = 0; $LoopIndex < $tdsarThreeDSecureAuthenticationResult->getErrorMessages()->getCount(); $LoopIndex++ ) {
+						$Message = $Message."<li>".$tdsarThreeDSecureAuthenticationResult->getErrorMessages()->getAt( $LoopIndex )."</li>";
+					}
+					$Message = $Message."</ul>";
+					$TransactionSuccessful = false;
+				}
+				if ( $todTransactionOutputData == null ) {
+					$szResponseCrossReference = "";
+				}
+				else {
+					$szResponseCrossReference = $todTransactionOutputData->getCrossReference();
+				}
+				$TransactionSuccessful = FALSE;
+				self::set_error_messages( $Message );
+				break;
+			default:
+				// unhandled status code
+				$Message = $tdsarThreeDSecureAuthenticationResult->getMessage();
+				if ( $todTransactionOutputData == null ) {
+					$szResponseCrossReference = "";
+				}
+				else {
+					$szResponseCrossReference = $todTransactionOutputData->getCrossReference();
+				}
+				$TransactionSuccessful = FALSE;
+				self::set_error_messages( $Message );
+				break;
 			}
 		}
 
-		$NVP_Data['x_line_item'] = rtrim( $line_items, "&x_line_item=" );
-
-		if ( isset( $checkout->cache['shipping'] ) ) {
-			$NVP_Data['x_ship_to_first_name'] = $checkout->cache['shipping']['first_name'];
-			$NVP_Data['x_ship_to_last_name'] = $checkout->cache['shipping']['last_name'];
-			$NVP_Data['x_ship_to_address'] = $checkout->cache['shipping']['street'];
-			$NVP_Data['x_ship_to_city'] = $checkout->cache['shipping']['city'];
-			$NVP_Data['x_ship_to_state'] = $checkout->cache['shipping']['zone'];
-			$NVP_Data['x_ship_to_zip'] = $checkout->cache['shipping']['postal_code'];
-			$NVP_Data['x_ship_to_country'] = $checkout->cache['shipping']['country'];
-		}
-
-		if ( $this->api_mode == self::MODE_TEST ) {
-			$NVP_Data ['x_test_request'] = 'TRUE';
-		}
-
-		$NVP_Data = apply_filters( 'gb_paymentsense_nvp_data', $NVP_Data );
-
-		//$NVP_Data = array_map('rawurlencode', $NVP_Data);
-		return $NVP_Data;
 	}
 
 	public function register_settings() {
 		$page = Group_Buying_Payment_Processors::get_settings_page();
 		$section = 'gb_authorizenet_settings';
 		add_settings_section( $section, self::__( 'PaymentSense' ), array( $this, 'display_settings_section' ), $page );
-		register_setting( $page, self::API_MODE_OPTION );
+		//register_setting( $page, self::API_MODE_OPTION );
 		register_setting( $page, self::API_USERNAME_OPTION );
 		register_setting( $page, self::API_PASSWORD_OPTION );
-		add_settings_field( self::API_MODE_OPTION, self::__( 'Mode' ), array( $this, 'display_api_mode_field' ), $page, $section );
+		//add_settings_field( self::API_MODE_OPTION, self::__( 'Mode' ), array( $this, 'display_api_mode_field' ), $page, $section );
 		add_settings_field( self::API_USERNAME_OPTION, self::__( 'API Login (Username)' ), array( $this, 'display_api_username_field' ), $page, $section );
 		add_settings_field( self::API_PASSWORD_OPTION, self::__( 'Transaction Key (Password)' ), array( $this, 'display_api_password_field' ), $page, $section );
-		//add_settings_field(null, self::__('Currency'), array($this, 'display_currency_code_field'), $page, $section);
+		add_settings_field(null, self::__('Currency'), array($this, 'display_currency_code_field'), $page, $section);
 	}
 
 	public function display_api_username_field() {
@@ -292,7 +454,8 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 	}
 
 	public function display_currency_code_field() {
-		echo 'Specified in your Authorize.Net Merchant Interface.';
+		echo '<input type="text" name="'.self::API_CC_OPTION.'" value="'.$this->currency_code.'" size="80" />';
+		echo '<br/>'.gb__('ISO 4217 e.g. 826');
 	}
 
 	public function display_exp_meta_box() {

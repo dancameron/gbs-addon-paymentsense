@@ -500,12 +500,12 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 
 		register_setting( $page, self::API_MERCHANTID_OPTION );
 		register_setting( $page, self::API_PASSWORD_OPTION );
-		register_setting( $page, self::API_SECRETKEY_OPTION );
+		//register_setting( $page, self::API_SECRETKEY_OPTION );
 		register_setting( $page, self::API_CC_OPTION );
 
 		add_settings_field( self::API_MERCHANTID_OPTION, self::__( 'Merchant ID (Username)' ), array( $this, 'display_api_username_field' ), $page, $section );
 		add_settings_field( self::API_PASSWORD_OPTION, self::__( 'Merchant Password' ), array( $this, 'display_api_password_field' ), $page, $section );
-		add_settings_field( self::API_SECRETKEY_OPTION, self::__( 'Secret Key' ), array( $this, 'display_api_key_field' ), $page, $section );
+		//add_settings_field( self::API_SECRETKEY_OPTION, self::__( 'Secret Key' ), array( $this, 'display_api_key_field' ), $page, $section );
 		add_settings_field( self::API_CC_OPTION, self::__( 'Currency' ), array( $this, 'display_currency_code_field' ), $page, $section );
 	}
 

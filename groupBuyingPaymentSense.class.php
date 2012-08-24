@@ -19,7 +19,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 	private $api_secretkey = '';
 	private $currency_code = '';
 
-	protected static function get_instance() {
+	public static function get_instance() {
 		if ( !( isset( self::$instance ) && is_a( self::$instance, __CLASS__ ) ) ) {
 			self::$instance = new self();
 		}
@@ -70,6 +70,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 	 * @return Group_Buying_Payment|bool FALSE if the payment failed, otherwise a Payment object
 	 */
 	public function process_payment( Group_Buying_Checkouts $checkout, Group_Buying_Purchase $purchase, $threeD_pass = FALSE ) {
+		error_log( "process: " . print_r( TRUE, true ) );
 		if ( $purchase->get_total( $this->get_payment_method() ) < 0.01 ) {
 			// Nothing to do here, another payment handler intercepted and took care of everything
 			// See if we can get that payment and just return it

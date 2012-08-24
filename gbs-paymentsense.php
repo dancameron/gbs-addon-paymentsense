@@ -1,7 +1,7 @@
 <?php
 /*
 Plugin Name: Group Buying Payment Processor - PaymentSense
-Version: Beta 2
+Version: 1
 Plugin URI: http://sproutventure.com/wordpress/group-buying
 Description: PaymentSense Add-on.
 Author: Sprout Venture

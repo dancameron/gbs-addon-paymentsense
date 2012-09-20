@@ -48,18 +48,24 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 
 		add_action( 'admin_init', array( $this, 'register_settings' ), 10, 0 );
 		add_action( 'purchase_completed', array( $this, 'complete_purchase' ), 10, 1 );
+		add_action(self::CRON_HOOK, array($this, 'capture_pending_payments'));
 
 		// Handle the return of user from 3dsecure
 		add_action('gb_load_cart', array($this,'back_from_3d_secure'), 10, 0);
 
-		// Limitations
-		add_filter( 'group_buying_template_meta_boxes/deal-expiration.php', array( $this, 'display_exp_meta_box' ), 10 );
-		add_filter( 'group_buying_template_meta_boxes/deal-price.php', array( $this, 'display_price_meta_box' ), 10 );
-		add_filter( 'group_buying_template_meta_boxes/deal-limits.php', array( $this, 'display_limits_meta_box' ), 10 );
+		// pop the products array so that only a single item can be added to the cart at a time.
+		add_action('gb_cart_load_products_get', array( get_class(), 'pop_cart_products'), 100, 2 );
 	}
 
 	public static function register() {
 		self::add_payment_processor( __CLASS__, self::__( 'PaymentSense' ) );
+	}
+	
+	public static function pop_cart_products( $products, Group_Buying_Cart $cart ) {
+		if ( count($products) > 1 ) {
+			return array(array_pop($products));
+		}
+		return $products;
 	}
 
 	/**
@@ -70,7 +76,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 	 * @return Group_Buying_Payment|bool FALSE if the payment failed, otherwise a Payment object
 	 */
 	public function process_payment( Group_Buying_Checkouts $checkout, Group_Buying_Purchase $purchase, $threeD_pass = FALSE ) {
-		error_log( "process: " . print_r( TRUE, true ) );
+
 		if ( $purchase->get_total( $this->get_payment_method() ) < 0.01 ) {
 			// Nothing to do here, another payment handler intercepted and took care of everything
 			// See if we can get that payment and just return it
@@ -86,7 +92,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 		} else {
 			$transaction_response = $this->process_sale( $checkout, $purchase );
 		}
-		error_log( "transaction_response: " . print_r( $transaction_response, true ) );
+		if ( self::DEBUG ) error_log( "transaction_response: " . print_r( $transaction_response, true ) );
 		if ( $transaction_response === FALSE ) {
 			return;
 		}
@@ -121,6 +127,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 				'data' => array(
 					'api_response' => $transaction_response, // TODO Pass the transaction object along and use it.
 					'masked_cc_number' => $this->mask_card_number( $this->cc_cache['cc_number'] ), // save for possible credits later
+					'uncaptured_deals' => $deal_info,
 				),
 				'deals' => $deal_info,
 				'shipping_address' => $shipping_address,
@@ -130,7 +137,6 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 		}
 		$payment = Group_Buying_Payment::get_instance( $payment_id );
 		do_action( 'payment_authorized', $payment );
-		$payment->set_data( $response );
 		return $payment;
 	}
 
@@ -148,9 +154,20 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 		$payments = Group_Buying_Payment::get_payments_for_purchase( $purchase->get_id() );
 		foreach ( $payments as $payment_id ) {
 			$payment = Group_Buying_Payment::get_instance( $payment_id );
-			do_action( 'payment_captured', $payment, $items_captured );
-			do_action( 'payment_complete', $payment );
-			$payment->set_status( Group_Buying_Payment::STATUS_COMPLETE );
+			$this->capture_payment( $payment );
+		}
+	}
+
+	/**
+	 * Try to capture all pending payments
+	 *
+	 * @return void
+	 */
+	public function capture_pending_payments() {
+		$payments = Group_Buying_Payment::get_pending_payments();
+		foreach ( $payments as $payment_id ) {
+			$payment = Group_Buying_Payment::get_instance($payment_id);
+			$this->capture_payment($payment);
 		}
 	}
 
@@ -213,7 +230,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 		$cdtCardDetailsTransaction->getMerchantAuthentication()->setMerchantID( (string) $this->api_merchantid );
 		$cdtCardDetailsTransaction->getMerchantAuthentication()->setPassword( (string) $this->api_password );
 
-		$cdtCardDetailsTransaction->getTransactionDetails()->getMessageDetails()->setTransactionType( "SALE" );
+		$cdtCardDetailsTransaction->getTransactionDetails()->getMessageDetails()->setTransactionType( "PREAUTH" );
 
 		$cdtCardDetailsTransaction->getTransactionDetails()->getAmount()->setValue( $amount );
 
@@ -270,11 +287,11 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 		$cdtCardDetailsTransaction->getCustomerDetails()->setPhoneNumber( $checkout->cache['billing']['phone'] );
 		$cdtCardDetailsTransaction->getCustomerDetails()->setCustomerIPAddress( $_SERVER['REMOTE_ADDR'] );
 
-		error_log( "TRANSACTION +++++++++++++++++++: " . print_r( $cdtCardDetailsTransaction, true ) );
+		if ( self::DEBUG ) error_log( "TRANSACTION +++++++++++++++++++: " . print_r( $cdtCardDetailsTransaction, true ) );
 
 		$boTransactionProcessed = $cdtCardDetailsTransaction->processTransaction( $cdtrCardDetailsTransactionResult, $todTransactionOutputData );
 
-		error_log( "PROCESSED TRANSACTION +++++++++++++++++++: " . print_r( $boTransactionProcessed, true ) );
+		if ( self::DEBUG ) error_log( "PROCESSED TRANSACTION +++++++++++++++++++: " . print_r( $boTransactionProcessed, true ) );
 
 		if ( !$boTransactionProcessed ) {
 			// could not communicate with the payment gateway
@@ -282,13 +299,14 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 			self::set_error_messages( $message );
 			$TransactionSuccessful = FALSE;
 		} else {
-			error_log( "status code ++++++++++: " . print_r( $cdtrCardDetailsTransactionResult->getStatusCode(), true ) );
+			if ( self::DEBUG ) error_log( "status code ++++++++++: " . print_r( $cdtrCardDetailsTransactionResult->getStatusCode(), true ) );
 			switch ( $cdtrCardDetailsTransactionResult->getStatusCode() ) {
 			case 0:
 				// status code of 0 - means transaction successful
 				$Message = $cdtrCardDetailsTransactionResult->getMessage();
 				self::set_error_messages( $Message );
 				$TransactionSuccessful = $cdtrCardDetailsTransactionResult;
+				$TransactionSuccessful->CrossReference = $todTransactionOutputData->getCrossReference();
 				break;
 			case 3:
 				// status code of 3 - means 3D Secure authentication required
@@ -355,6 +373,70 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 		return $TransactionSuccessful;
 	}
 
+	public  function capture_payment( Group_Buying_Payment $payment ) {
+		// is this the right payment processor? does the payment still need processing?
+		if ( $payment->get_payment_method() == $this->get_payment_method() && $payment->get_status() != Group_Buying_Payment::STATUS_COMPLETE ) {
+			//$payment->set_status(Group_Buying_Payment::STATUS_COMPLETE);
+			$data = $payment->get_data();
+			// Do we have a transaction ID to use for the capture?
+			if ( isset( $data['api_response'] ) ) {
+				$items_to_capture = $this->items_to_capture($payment);
+				if ( $items_to_capture ) {
+					
+					// Get amount
+					$total = 0;
+					foreach ( $items_to_capture as $price ) {
+						$total += $price;
+					}
+
+					// Do some juggling of the object to get the cross reference id
+					$json  = json_encode( $data['api_response'] );
+					$api_response = json_decode( $json, true );
+					$CrossReference = $api_response['CrossReference'];
+
+					// Payment
+					require_once 'lib/PaymentSystem.php';
+					$rgeplRequestGatewayEntryPointList = new RequestGatewayEntryPointList();
+
+					$rgeplRequestGatewayEntryPointList->add( "https://gw1.".self::get_api_url(), 100, 1 );
+					$rgeplRequestGatewayEntryPointList->add( "https://gw2.".self::get_api_url(), 200, 1 );
+					$rgeplRequestGatewayEntryPointList->add( "https://gw3.".self::get_api_url(), 300, 1 );
+
+					$CrossReferenceTransaction = new CrossReferenceTransaction( $rgeplRequestGatewayEntryPointList );
+
+					$CrossReferenceTransaction->getMerchantAuthentication()->setMerchantID( (string) $this->api_merchantid );
+					$CrossReferenceTransaction->getMerchantAuthentication()->setPassword( (string) $this->api_password );
+
+					$CrossReferenceTransaction->getTransactionDetails()->getMessageDetails()->setTransactionType( "COLLECTION" );
+					$CrossReferenceTransaction->getTransactionDetails()->getMessageDetails()->setCrossReference( $CrossReference );
+
+					$CrossReferenceTransaction->getTransactionDetails()->getAmount()->setValue( $total );
+
+					$CrossReferenceTransaction->getTransactionDetails()->getCurrencyCode()->setValue( $this->currency_code );
+
+					$CrossReferenceTransaction->getTransactionDetails()->setOrderID( (string) $payment->get_purchase() );
+					
+					$boTransactionProcessed = $CrossReferenceTransaction->processTransaction( $cdtrCardDetailsTransactionResult, $todTransactionOutputData );
+					
+					if ( $cdtrCardDetailsTransactionResult->getStatusCode() == ( 0 || 20 ) ) { // success or duplicate
+						foreach ( $items_to_capture as $deal_id => $amount ) {
+							unset($data['uncaptured_deals'][$deal_id]);
+						}
+						// Reset data
+						if ( !isset($data['capture_response']) ) {
+							$data['capture_response'] = array();
+						}
+						$data['capture_response'] = $cdtrCardDetailsTransactionResult;
+						$payment->set_data( $data );
+						do_action('payment_captured', $payment, array_keys($items_to_capture));
+						$payment->set_status(Group_Buying_Payment::STATUS_COMPLETE);
+						do_action('payment_complete', $payment);
+					}
+				}
+			}
+		}
+	}
+
 	public static function redirect( $PaREQ, $CrossReference, $acs_url, $return_url ) {
 
 		$_input = '  <input type="hidden" name="%s" value="%s"  />';
@@ -399,7 +481,6 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 			return FALSE;
 		}
 
-		error_log( "post: " . print_r( $_POST, true ) );
 		$api_merchantid = get_option( self::API_MERCHANTID_OPTION, '' );
 		$api_password = get_option( self::API_PASSWORD_OPTION, '' );
 
@@ -422,7 +503,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 
 		$boTransactionProcessed = $tdsaThreeDSecureAuthentication->processTransaction( $tdsarThreeDSecureAuthenticationResult, $todTransactionOutputData );
 
-		error_log( "3D secure authentication: " . print_r( $tdsarThreeDSecureAuthenticationResult->getStatusCode(), true ) );
+		if ( self::DEBUG ) error_log( "3D secure authentication: " . print_r( $tdsarThreeDSecureAuthenticationResult->getStatusCode(), true ) );
 
 		if ( $boTransactionProcessed == false ) {
 			// could not communicate with the payment gateway
@@ -431,7 +512,7 @@ class Group_Buying_PaymentSense extends Group_Buying_Credit_Card_Processors {
 			$TransactionSuccessful = FALSE;
 		}
 		else {
-			error_log( "3D secure authentication code: " . print_r( $tdsarThreeDSecureAuthenticationResult->getStatusCode(), true ) );
+			if ( self::DEBUG ) error_log( "3D secure authentication code: " . print_r( $tdsarThreeDSecureAuthenticationResult->getStatusCode(), true ) );
 
 			switch ( $tdsarThreeDSecureAuthenticationResult->getStatusCode() ) {
 			case 0:

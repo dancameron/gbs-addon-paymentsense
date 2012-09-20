@@ -1,6 +1,6 @@
 <?php
 /*
-Plugin Name: Group Buying Payment Processor - PaymentSense
+Plugin Name: Group Buying Payment Processor - PaymentSense (Custom: Cart Disabler and Purchase Limit Enabler)
 Version: 1
 Plugin URI: http://sproutventure.com/wordpress/group-buying
 Description: PaymentSense Add-on.
